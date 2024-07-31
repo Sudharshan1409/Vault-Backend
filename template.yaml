@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: The environment to deploy the stack to
+
+Resources:
+
+  # ----------Cognito Resources----------
+
+  VaultUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub VaultUserPool-${Environment}
+
+  VaultUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub VaultUserPoolClient-${Environment}
+      UserPoolId: !Ref VaultUserPool
+      GenerateSecret: false
+
+  VaultIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub VaultIdentityPool-${Environment}
+      AllowUnauthenticatedIdentities: true
+      CognitoIdentityProviders:
+        - ClientId: !Ref VaultUserPoolClient
+          ProviderName: !GetAtt VaultUserPool.ProviderName
+
+  # ----------Cognito Identity Pool Roles----------
+
+  VaultAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: 'cognito-identity.amazonaws.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref VaultIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: VaultAuthPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:*'
+                  - 'execute-api:*'
+                Resource: '*'
+
+  VaultUnauthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: 'cognito-identity.amazonaws.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref VaultIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      Policies:
+        - PolicyName: VaultUnauthPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'execute-api:Invoke'
+                Resource: '*'
+
+  IdentityPoolRoleMapping:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref VaultIdentityPool
+      Roles:
+        authenticated: !GetAtt VaultAuthRole.Arn
+        unauthenticated: !GetAtt VaultUnauthRole.Arn
+
+  # ----------DynamoDB Table----------
+
+  VaultTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub VaultTable-${Environment}
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # ----------API Gateway----------
+
+  VaultAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub VaultAPI-${Environment}
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt VaultUserPool.Arn
+      Cors:
+        AllowMethods: "'OPTIONS,GET,POST'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # ----------Lambda Functions----------
+
+  AddCredentials:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./
+      FunctionName: !Sub AddCredentials-${AWS::StackName}-${Environment}
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref VaultTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VaultTable
+      Events:
+        GetResource:
+          Type: Api
+          Properties:
+            Path: /resource
+            Method: get
+            RestApiId: !Ref VaultAPI
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - modules/vault/addCredential/index.ts
+        # External:
+        #   - "@aws-sdk/client-dynamodb"
+        #   - "@aws-sdk/lib-dynamodb"
+        #   - "@aws-sdk/util-dynamodb"
+        #   - "@aws-sdk/client-ses"
+        #   - "@aws-sdk/client-eventbridge"
+        #   - "@aws-sdk/client-s3"
+        #   - "@aws-sdk/client-scheduler"
+
+Outputs:
+  ApiUrl:
+    Description: "URL for API"
+    Value: !Sub "https://${VaultAPI}.execute-api.${AWS::Region}.amazonaws.com/Prod/resource"
+
